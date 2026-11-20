@@ -63,13 +63,27 @@ class UniDepthEstimator:
         self.model = self.load_model()
     
     def load_model(self):
+        repo_id = f"lpiccinelli/unidepth-{self.model_type}"
         if 'v1' in self.model_type:
-            model = UniDepthV1.from_pretrained(f"lpiccinelli/unidepth-{self.model_type}")
+            model = UniDepthV1.from_pretrained(repo_id)
         elif 'v2' in self.model_type:
-            model = UniDepthV2.from_pretrained(f"lpiccinelli/unidepth-{self.model_type}")
-            # Also available from TorchHub
-            #model = torch.hub.load("lpiccinelli-eth/UniDepth", "UniDepth", version='v2', backbone='vitl14', pretrained=True, trust_repo=True, force_reload=True)
-            # Local from unidepth/hubconf.py:33 (local state dict path)
+            # Find the 2024 commit on HuggingFace that matches the local unidepthv2 codebase
+            revision = None
+            try:
+                from huggingface_hub import HfApi
+                commits = HfApi().list_repo_commits(repo_id)
+                # Pick the latest commit prior to the Feb 2025 breaking architecture change
+                for c in commits:
+                    if c.created_at.year < 2025:
+                        revision = c.commit_id
+                        print(f"Using compatible 2024 HF checkpoint revision: {revision[:8]}")
+                        break
+                if revision is None and len(commits) > 1:
+                    revision = commits[-1].commit_id  # fallback to initial commit
+            except Exception as e:
+                print(f"Could not query HF commit history ({e}), trying default...")
+
+            model = UniDepthV2.from_pretrained(repo_id, revision=revision)
         else:
             print('Model not found.')
             return None

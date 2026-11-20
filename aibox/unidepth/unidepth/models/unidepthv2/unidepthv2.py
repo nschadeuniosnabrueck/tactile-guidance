@@ -344,7 +344,20 @@ class UniDepthV2(
         self.slices_encoder_range = list(
             zip([0, *pixel_encoder.depths[:-1]], pixel_encoder.depths)
         )
-        self.shape_constraints = config["data"]["shape_constraints"]
+
+        default_shape_constraints = {
+            "pixels_bounds": [1400, 2400],
+            "pixels_bounds_ori": [1400, 2400],
+            "ratio_bounds": [0.5, 2.5],
+            "patch_size": config["model"]["pixel_encoder"]["patch_size"],
+        }
+        self.shape_constraints = {
+            **default_shape_constraints,
+            **config.get("data", {}).get("shape_constraints", {}),
+        }
+        self.shape_constraints.setdefault(
+            "patch_size", config["model"]["pixel_encoder"]["patch_size"]
+        )
         self.shape_constraints["pixels_bounds_ori"] = self.shape_constraints.get(
             "pixels_bounds", [1400, 2400]
         )
