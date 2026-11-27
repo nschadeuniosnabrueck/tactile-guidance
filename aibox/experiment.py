@@ -138,7 +138,7 @@ from yolov5.utils.torch_utils import smart_inference_mode  # noqa: E402
 
 TASKS = ["grasping", "multiple_objects", "depth_navigation"]
 TASK_TARGETS = {
-    "grasping": ["bottle", "bicycle", "potted plant", "bowl", "cup"],
+    "grasping": ["bottle", "clock", "potted plant", "bowl", "cup"],
     "multiple_objects": ["bottle"],
     "depth_navigation": ["bottle"],
 }

@@ -79,11 +79,11 @@ if __name__ == '__main__':
     run_depth_estimator = True if condition == 'depth_navigation' else False
     weights_depth_estimator = 'v2-vits14' if metric else 'midas_v21_384'  # v2-vits14, v1-cnvnxtl; midas_v21_384, dpt_levit_224
 
-    source = '1'  # image/video path or camera source (0 = webcam, 1 = external, ...)
+    source = '0'  # image/video path or camera source (0 = webcam, 1 = external, ...)
     belt_controller = None
 
     # Experiment controls
-    target_objs = ['bottle', 'bicycle', 'potted plant', 'bowl', 'cup'] * 2 if condition == 'grasping' else ['bottle'] * 5
+    target_objs = ['bottle', 'cup'] * 2 if condition == 'grasping' else ['bottle'] * 5
     output_path = 'results/' + f'{condition}/'
 
     if not os.path.exists(output_path):
