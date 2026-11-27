@@ -399,11 +399,11 @@ class BraceletController:
                             belt_controller.send_pulse_command(
                                 channel_index=1,
                                 orientation_type=BeltOrientationType.BINARY_MASK,
-                                orientation=0b101000,
+                                orientation=0b101000, #which motors to vibrate (binary mask) - 4 first numbers are the 4 motors
                                 intensity=30,
                                 on_duration_ms=150,
-                                pulse_period=300,
-                                pulse_iterations=5,
+                                pulse_period=300, #pauses between vibrations
+                                pulse_iterations=5, #how many times
                                 series_period=5000,
                                 series_iterations=1,
                                 timer_option=BeltVibrationTimerOption.RESET_TIMER,

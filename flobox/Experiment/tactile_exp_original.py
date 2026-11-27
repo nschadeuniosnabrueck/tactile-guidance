@@ -89,7 +89,7 @@ def main():
         
     else:
         # list of numbers repeated 8 times
-        numbers_t = [i for i in range(1, 10)] * 8
+        numbers_t = [i for i in range(1, 6)] * 8
         # shuffle the list
         random.shuffle(numbers_t)
         # split the shuffled list into 8 block 

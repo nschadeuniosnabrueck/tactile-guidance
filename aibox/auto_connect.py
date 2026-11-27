@@ -33,7 +33,7 @@ def interactive_belt_connect(belt_controller):
     # Ask for the interface
     #interface = input("Connect via Bluetooth or USB? [b,u]")
     #interface = ""
-    #print("Connect via Bluetooth or USB? [b,u]", end="")
+    print("Connect via Bluetooth or USB? [b,u]", end="")
     #while interface == "":
     interface = input()
     #interface = 'b'

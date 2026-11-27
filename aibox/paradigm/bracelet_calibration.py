@@ -5,12 +5,28 @@ import os
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(parent_dir)
 
-import keyboard
+from pynput import keyboard as kb
 import time
 import json
 from pybelt.belt_controller import (BeltOrientationType, BeltVibrationPattern)
 from bracelet import connect_belt
 from controller import close_app
+import argparse
+
+_pressed = set()
+
+def _on_press(key):
+    _pressed.add(key)
+
+def _on_release(key):
+    _pressed.discard(key)
+
+kb.Listener(on_press=_on_press, on_release=_on_release, daemon=True).start()
+
+def is_pressed(name):
+    if len(name) == 1:
+        return kb.KeyCode.from_char(name) in _pressed
+    return getattr(kb.Key, name) in _pressed   # "enter", "space", "esc", "up", ...
 
 
 def calibrate_intensity(direction):
@@ -50,13 +66,13 @@ def calibrate_intensity(direction):
             )
         print(f'Vibrating at intensity {intensity}.')
 
-        if keyboard.is_pressed('up') and intensity < 100:
+        if is_pressed('up') and intensity < 100:
             intensity += 5
             time.sleep(0.1)
-        elif keyboard.is_pressed('down') and intensity > 5: # no reason to vibrate with intensity of 0
+        elif is_pressed('down') and intensity > 5: # no reason to vibrate with intensity of 0
             intensity -= 5
             time.sleep(0.1)
-        elif keyboard.is_pressed('y'):
+        elif is_pressed('y'):
             belt_controller.stop_vibration()
             time.sleep(1)
             return intensity
@@ -64,7 +80,18 @@ def calibrate_intensity(direction):
 
 if __name__ == '__main__':
 
-    participant = 0
+    parser = argparse.ArgumentParser(description="Argument parser for participant number.")
+    
+    # Add arguments
+    parser.add_argument(
+        "-p", "--participant",
+        type=int,
+        required=True,
+        help="Participant number (randomize manually before)."
+    )
+
+    args = parser.parse_args()
+    participant = args.participant
     output_path = str(parent_dir) + '/results/calibration/'
 
     if not os.path.exists(output_path):
