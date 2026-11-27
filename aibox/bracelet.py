@@ -54,6 +54,7 @@ class BraceletController:
         self.navigation_time = 'NA'
         self.freezing_time = 'NA'
         self.grasping_time = 'NA'
+        self.last_search_cmd = 0.0
 
 
     def choose_detection(self, bboxes, previous_bbox=None, hand=False, w=1920, h=1080):
@@ -542,10 +543,12 @@ class BraceletController:
 
         # 3. Target is located and hand can be moved into the frame
         if target is not None:
-            self.timer += 1
-            if belt_controller and self.vibrate and self.searching:
+            now = time.time()
+            # re-send the search cue every 3 s of wall-clock time (was every 50 processed frames)
+            if belt_controller and self.vibrate and (self.searching or now - self.last_search_cmd >= 3.0):
                 self.searching = False
-                belt_controller.stop_vibration()
+                self.last_search_cmd = now
+                belt_controller.stop_vibration()            
                 belt_controller.send_pulse_command(
                     channel_index=0,
                     orientation_type=BeltOrientationType.ANGLE,
@@ -560,15 +563,10 @@ class BraceletController:
                     exclusive_channel=False,
                     clear_other_channels=False
                 )
-            # reset searching flag to send command again
-            if self.timer >= 50:
-                self.searching = True
-                self.timer = 0
             return overlapping, target
 
         # 4. Target is not in the frame yet.
         else:
-            self.timer = 0
             self.searching = True
             if belt_controller and self.vibrate:
                 belt_controller.stop_vibration()

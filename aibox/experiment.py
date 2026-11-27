@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-experiment.py - combined auditory / tactile grasping experiment.
+experiment.py - combined auditory / tactile grasping experiment (script v2.1, frame-gated).
 
 Tasks always run in this order: grasping -> multiple_objects -> depth_navigation.
 Within each task, auditory and tactile blocks alternate (A T A T ... or T A T A ...).
@@ -8,7 +8,7 @@ Within each task, auditory and tactile blocks alternate (A T A T ... or T A T A 
 Keys, in the OpenCV window:
   READY state
     S        start trial
-    O        enter obstacle/layout label in the terminal (kept until changed)
+    O        set obstacle/layout label in the terminal (kept until changed)
     C        abort session
   RUNNING state
     Y / N / F / T   end trial: success / fail / system fail / wrong target
@@ -17,13 +17,19 @@ Keys, in the OpenCV window:
   BREAK screen
     SPACE    continue,  C  abort
 
-Tactile condition: full pipeline + bracelet guidance.
+Tactile condition: full pipeline + bracelet guidance. Perception and bracelet logic run
+only on NEW camera frames; duplicate frames reuse the last result.
 Auditory condition: camera preview only, no models run, experimenter guides verbally.
+
+Success without a grasp signal (tactile): the experimenter is asked in the terminal
+  success_no_signal = 1  -> kept as success
+  success_no_signal = 0  -> rejected, stored as outcome 'success_no_signal_rejected' (key n)
+  NA                     -> not applicable
 
 Outputs (results/experiment/):
   participant_<p>_<stamp>_trials.csv   one row per trial
-  participant_<p>_<stamp>_frames.csv   one row per frame of every running trial
-  participant_<p>_<stamp>_config.json  session settings and plan
+  participant_<p>_<stamp>_frames.csv   one row per new camera frame during trials
+  participant_<p>_<stamp>_config.json  settings, targets, calibration, plan, file hashes
   videos/participant_<p>_<stamp>/      per-block videos + *_timestamps.csv (optional)
 """
 
@@ -35,6 +41,7 @@ import time
 import types
 import random
 import argparse
+import hashlib
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -46,7 +53,9 @@ for sub in ("yolov5", "strongsort", "midas", "unidepth"):
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F  # noqa: F401
+
+SCRIPT_VERSION = "2.1-frame-gated"
+MOVE_BACK_MIN_S = 0.5          # move-back shorter than this is treated as flicker
 
 
 # xformers shim: UniDepth (V1 and V2 DepthHead) imports
@@ -133,12 +142,10 @@ from yolov5.utils.plots import Annotator, colors    # noqa: E402
 from yolov5.utils.torch_utils import smart_inference_mode  # noqa: E402
 
 
-
 # Constants
-
 TASKS = ["grasping", "multiple_objects", "depth_navigation"]
 TASK_TARGETS = {
-    "grasping": ["bottle", "bicycle", "potted plant", "bowl", "cup"],
+    "grasping": ["bottle", "clock", "potted plant", "bowl", "cup"],
     "multiple_objects": ["bottle"],
     "depth_navigation": ["bottle"],
 }
@@ -159,23 +166,25 @@ FIELDS = [
     "participant", "task", "condition", "first_condition", "block", "n_blocks", "block_global",
     "trial_in_block", "trial_in_condition", "target", "obstacle_layout",
     "start_time", "end_time", "duration_s",
-    "navigation_onset_s", "freezing_onset_s", "grasp_signal_s", "grasp_sent",
+    "navigation_onset_s", "freezing_onset_s", "grasp_signal_s", "grasp_sent", "success_no_signal",
     "first_instr_s", "grasp_instr_s", "num_instructions", "instructions", "instr_times_s",
     "n_frames", "mean_fps", "hand_detect_rate", "target_detect_rate",
-    "obstacle_frame_rate", "first_obstacle_s", "n_move_back",
+    "obstacle_frame_rate", "first_obstacle_s", "n_move_back", "move_back_s",
     "video_raw", "video_annotated",
     "outcome_key", "outcome",
 ]
 
 FRAME_FIELDS = [
     "participant", "task", "condition", "block_global", "trial_in_condition", "target",
-    "frame", "t_rel_s", "wall_time", "fps", "raw_video_frame", "annotated_video_frame",
+    "frame", "camera_frame", "t_rel_s", "wall_time", "fps", "raw_video_frame", "annotated_video_frame",
     "n_dets",
     "hand_x", "hand_y", "hand_w", "hand_h", "hand_conf", "hand_depth",
     "target_x", "target_y", "target_w", "target_h", "target_conf", "target_depth",
+    "hand_detected", "target_detected",
     "frozen", "grasped", "obstacle", "obstacle_x", "obstacle_y", "roi_min_y", "move_back",
     "int_right", "int_left", "int_top", "int_bottom",
     "instruction",
+    "t_perceive_ms", "t_nav_ms",
 ]
 
 
@@ -229,7 +238,7 @@ def write_timestamps(path, times):
             w.writerow([i, round(t, 4)])
 
 
-# Camera: shared threaded capture, with optional raw recording at camera rate
+# Camera: shared threaded capture, frame counter, optional raw recording
 class Camera:
     def __init__(self, source):
         src = int(source) if str(source).isnumeric() else source
@@ -242,6 +251,7 @@ class Camera:
         fps = self.cap.get(cv2.CAP_PROP_FPS)
         self.fps = fps if fps and 1 <= fps <= 120 else 30.0
         self.frame = frame
+        self.seq = 0                  # increments on every new camera frame
         self.lock = threading.Lock()
         self.writer = None
         self.rec_path = None
@@ -262,16 +272,17 @@ class Camera:
                 continue
             with self.lock:
                 self.frame = frame
+                self.seq += 1
                 if self.writer is not None:
                     self.writer.write(frame)
                     self.rec_times.append(time.time())
                     self.rec_count += 1
 
     def read(self):
-        """Returns (frame copy, index of that frame in the raw video or 'NA')."""
+        """Returns (frame copy, raw video index or 'NA', camera sequence number)."""
         with self.lock:
             idx = self.rec_count - 1 if self.writer is not None else "NA"
-            return self.frame.copy(), idx
+            return self.frame.copy(), idx, self.seq
 
     def start_recording(self, path):
         h, w = self.frame.shape[:2]
@@ -328,8 +339,9 @@ class ExperimentController(TaskController):
         self.frame_file = None
         self.frame_writer = None
         self._nav_this_frame = False
+        self._last_timing = {"t_perceive_ms": "NA", "t_nav_ms": "NA"}
 
-    # Setup: load models, warm up, open camera, prepare video writers
+    # Setup
     def setup(self):
         self.bs = 1
         self.load_object_detector()
@@ -394,10 +406,9 @@ class ExperimentController(TaskController):
             if hasattr(trk, "_next_id"):
                 trk._next_id = 1
 
-    # Video recording: start/stop per block, write annotated frames
+    # Video recording
     def start_block_video(self, blk):
-        base = (f"{self.task}_{blk['condition']}_B{blk['block']}"
-                f"_G{blk['block_global']:02d}")
+        base = f"{self.task}_{blk['condition']}_B{blk['block']}_G{blk['block_global']:02d}"
         self.raw_path = self.ann_path = None
         if self.save_video in ("raw", "both"):
             self.raw_path = self.video_dir / f"{base}_raw.mp4"
@@ -429,7 +440,7 @@ class ExperimentController(TaskController):
                              self.ann_times)
         self.ann_writer = None
 
-    # Perception: detect objects and hands, run tracker, estimate depth
+    # Perception: object detection, hand detection, tracking, depth estimation
     @smart_inference_mode()
     def perceive(self, im0, frame_idx, classes_obj, running):
         im = letterbox(im0, 640, stride=self.stride, auto=self.pt_obj)[0]
@@ -503,20 +514,41 @@ class ExperimentController(TaskController):
             rec["vib_timer"] = -1
         return None
 
-    # Logging: per-frame and per-trial, with optional CSV output
+    # Move-back detection: obstacle in front of hand, hand and target both present, ROI <= 5
+    def _close_move_back(self, rec, t_rel, min_s=MOVE_BACK_MIN_S):
+        """End an open move-back episode. Episodes shorter than min_s are treated as flicker."""
+        if rec["mb_start"] is None:
+            return
+        dur = t_rel - rec["mb_start"]
+        rec["mb_start"] = None
+        if dur >= min_s:
+            rec["mb_episodes"] += 1
+            rec["mb_time_s"] += dur
+
+    def _update_move_back(self, rec, mb, t_rel):
+        if mb and rec["mb_start"] is None:
+            rec["mb_start"] = t_rel
+        elif not mb:
+            self._close_move_back(rec, t_rel)
+
+    # Logging: one row per new camera frame, with perception and bracelet state
     def log_frame(self, rec, blk, i_cond, target, target_cls, outputs, fps,
-                  raw_idx, ann_idx, instr, tactile):
+                  raw_idx, cam_seq, ann_idx, instr, tactile):
         now = time.time()
         t_rel = now - rec["start"]
         rec["frames"] += 1
-        rec["fps"].append(fps)
+        if fps is not None:
+            rec["fps"].append(fps)
 
         row = dict.fromkeys(FRAME_FIELDS, "NA")
         row.update(participant=self.participant, task=self.task, condition=blk["condition"],
                    block_global=blk["block_global"], trial_in_condition=i_cond, target=target,
-                   frame=rec["frames"], t_rel_s=round(t_rel, 3), wall_time=round(now, 4),
-                   fps=round(fps, 1), raw_video_frame=raw_idx, annotated_video_frame=ann_idx,
-                   instruction=instr)
+                   frame=rec["frames"], camera_frame=cam_seq, t_rel_s=round(t_rel, 3),
+                   wall_time=round(now, 4),
+                   fps=round(fps, 1) if fps is not None else "NA",
+                   raw_video_frame=raw_idx, annotated_video_frame=ann_idx,
+                   instruction=instr, n_dets=len(outputs))
+        row.update(self._last_timing)
 
         if tactile:
             bc = self.bracelet_controller
@@ -537,9 +569,7 @@ class ExperimentController(TaskController):
                 rec["obstacle_frames"] += 1
                 if rec["first_obstacle"] is None:
                     rec["first_obstacle"] = round(t_rel, 3)
-            if mb and not rec["mb_prev"]:
-                rec["move_back"] += 1
-            rec["mb_prev"] = mb
+            self._update_move_back(rec, mb, t_rel)
 
             ints = ["NA"] * 4
             if nav and hand is not None and tgt is not None and not mb and not rec["grasped"]:
@@ -554,10 +584,10 @@ class ExperimentController(TaskController):
             tx = bb_values(tgt)
             ox, oy = point_xy(obs) if is_obs else ("NA", "NA")
             row.update(
-                n_dets=len(outputs),
                 hand_x=hx[0], hand_y=hx[1], hand_w=hx[2], hand_h=hx[3], hand_conf=hx[4], hand_depth=hx[5],
                 target_x=tx[0], target_y=tx[1], target_w=tx[2], target_h=tx[3],
                 target_conf=tx[4], target_depth=tx[5],
+                hand_detected=int(has_hand), target_detected=int(has_tgt),
                 frozen=int(bool(bc.frozen)), grasped=int(bool(rec["grasped"])),
                 obstacle=int(is_obs), obstacle_x=ox, obstacle_y=oy,
                 roi_min_y=round(float(roi), 1) if is_obs else "NA",
@@ -568,7 +598,7 @@ class ExperimentController(TaskController):
         if self.frame_writer is not None:
             self.frame_writer.writerow(row)
 
-    # Helpers: stop belt, write CSV row, render annotated frame, wait for user input
+    # Helper functions
     def stop_belt(self):
         if self.belt_controller:
             try:
@@ -619,14 +649,24 @@ class ExperimentController(TaskController):
             if k == "c":
                 return False
 
-    # Trials
+    def ask_layout(self, where):
+        print(f"\nObstacle layout for {where}.")
+        cur = self.obstacle_layout or "none"
+        lbl = input(f"  current: '{cur}' | new label, Enter = keep, '-' = clear: ").strip()
+        if lbl == "-":
+            self.obstacle_layout = ""
+        elif lbl:
+            self.obstacle_layout = lbl
+        print(f"  layout now: '{self.obstacle_layout or 'none'}'")
+
+    # Trials logic
     def start_trial(self, cond):
         rec = dict(start=time.time(), grasped=False, vib_timer=None, freeze_t=None,
                    n_instr=0, instr="", last_instr=None, instr_times=[],
                    first_instr=None, grasp_instr=None,
                    frames=0, fps=[], hand_frames=0, target_frames=0,
                    obstacle_frames=0, first_obstacle=None,
-                   move_back=0, mb_prev=False)
+                   mb_start=None, mb_episodes=0, mb_time_s=0.0)
         if cond == "tactile":
             self.bracelet_controller = BraceletController(
                 vibration_intensities=self.participant_vibration_intensities)
@@ -636,6 +676,7 @@ class ExperimentController(TaskController):
 
     def finish_trial(self, rec, blk, i_blk, i_cond, target, key, outcome):
         end = time.time()
+        self._close_move_back(rec, end - rec["start"])
         self.stop_belt()
         aud = blk["condition"] == "auditory"
         rel = lambda t: round(t - rec["start"], 3) if isinstance(t, (int, float)) else "NA"
@@ -643,6 +684,19 @@ class ExperimentController(TaskController):
         if not aud and self.bracelet_controller:
             bc = self.bracelet_controller
             nav, frz, grs = rel(bc.navigation_time), rel(rec["freeze_t"]), rel(bc.grasping_time)
+
+        # Success without grasp signal: experimenter decides now and it is recorded.
+        success_no_signal = "NA"
+        if not aud and outcome == "success" and grs == "NA":
+            print("  SUCCESS without grasp signal - decide now.")
+            ans = input("  Keep as success? (y = keep / n = mark as failure): ").strip().lower()
+            if ans == "n":
+                outcome, key = "success_no_signal_rejected", "n"
+                success_no_signal = 0
+            else:
+                success_no_signal = 1
+            print(f"  -> recorded: {outcome}")
+
         n = rec["frames"]
         rate = lambda c: round(c / n, 3) if (n and not aud) else "NA"
         depth_task = (not aud) and self.task == "depth_navigation"
@@ -656,6 +710,7 @@ class ExperimentController(TaskController):
             duration_s=round(end - rec["start"], 3),
             navigation_onset_s=nav, freezing_onset_s=frz, grasp_signal_s=grs,
             grasp_sent=("NA" if aud else int(grs != "NA")),
+            success_no_signal=success_no_signal,
             first_instr_s=rec["first_instr"] if aud and rec["first_instr"] is not None else "NA",
             grasp_instr_s=rec["grasp_instr"] if aud and rec["grasp_instr"] is not None else "NA",
             num_instructions=rec["n_instr"] if aud else "NA",
@@ -667,13 +722,14 @@ class ExperimentController(TaskController):
             obstacle_frame_rate=rate(rec["obstacle_frames"]) if depth_task else "NA",
             first_obstacle_s=(rec["first_obstacle"] if depth_task and rec["first_obstacle"] is not None
                               else "NA"),
-            n_move_back=rec["move_back"] if depth_task else "NA",
+            n_move_back=rec["mb_episodes"] if depth_task else "NA",
+            move_back_s=round(rec["mb_time_s"], 3) if depth_task else "NA",
             video_raw=self.raw_path.name if self.raw_path else "NA",
             video_annotated=self.ann_path.name if self.ann_path else "NA",
             outcome_key=key, outcome=outcome))
         if self.frame_file:
             self.frame_file.flush()
-        print(f"  -> {outcome.upper()} ({end - rec['start']:.2f} s)")
+        print(f"  -> {outcome.upper()} ({end - rec['start']:.2f} s, {n} frames)")
         self.bracelet_controller = None
 
     def run_block(self, blk):
@@ -692,24 +748,42 @@ class ExperimentController(TaskController):
         self.stop_belt()
         trials = blk["trials"]
         i, state, rec, frame_idx = 0, "ready", None, 0
-        fps_hist = []
+        last_seq, last_new_t, new_hist = None, None, []
+        last_outputs, last_depth, last_curr = [], None, None
 
         while i < len(trials):
-            t_frame = time.perf_counter()
             i_cond, target = trials[i]
             target_cls = self.name2id[target]
-            im0, raw_idx = self.camera.read()
+            im0, raw_idx, seq = self.camera.read()
+            new_frame = seq != last_seq          # True only when the camera delivered a new image
+            last_seq = seq
             outputs, depth_img, curr_target = [], None, None
             self._nav_this_frame = False
+            self._last_timing = {"t_perceive_ms": "NA", "t_nav_ms": "NA"}
 
             if tactile:
-                classes = [target_cls] if state == "running" else self.classes_obj
-                outputs, depth_img = self.perceive(im0, frame_idx, classes, state == "running")
-                if state == "running":
-                    curr_target = self.navigation_step(rec, outputs, target_cls, depth_img)
+                if new_frame:
+                    classes = [target_cls] if state == "running" else self.classes_obj
+                    t0 = time.perf_counter()
+                    outputs, depth_img = self.perceive(im0, frame_idx, classes, state == "running")
+                    t1 = time.perf_counter()
+                    self._last_timing["t_perceive_ms"] = round((t1 - t0) * 1000, 1)
+                    if state == "running":
+                        curr_target = self.navigation_step(rec, outputs, target_cls, depth_img)
+                        self._last_timing["t_nav_ms"] = round((time.perf_counter() - t1) * 1000, 1)
+                    last_outputs, last_depth, last_curr = outputs, depth_img, curr_target
+                    frame_idx += 1
+                else:
+                    # duplicate camera frame: reuse last result, do not re-run models or bracelet logic
+                    outputs, depth_img, curr_target = last_outputs, last_depth, last_curr
 
-            frame_fps = 1.0 / max(time.perf_counter() - t_frame, 1e-6)
-            fps_hist = (fps_hist + [frame_fps])[-30:]
+            now = time.perf_counter()
+            if new_frame:
+                if last_new_t is not None:
+                    new_hist = (new_hist + [now - last_new_t])[-30:]
+                last_new_t = now
+            frame_fps = 1.0 / float(np.mean(new_hist)) if (new_frame and new_hist) else None
+            fps_txt = f"{1.0 / float(np.mean(new_hist)):.0f}" if new_hist else "--"
 
             hud = [f"{self.task.upper()} | {cond.upper()} | block {blk['block']}/{blk['n_blocks']} "
                    f"| trial {i + 1}/{len(trials)} (#{i_cond})",
@@ -723,14 +797,13 @@ class ExperimentController(TaskController):
                 elif rec["grasped"]:
                     hud.append("GRASP SIGNAL SENT")
             rec_flag = " | REC" if self.save_video != "none" else ""
-            hud.append(f"FPS {np.mean(fps_hist):.0f}{rec_flag} | C = abort session")
+            hud.append(f"FPS {fps_txt}{rec_flag} | C = abort session")
 
             shown = self.render(im0, outputs, curr_target, depth_img, hud, color)
-            ann_idx = self.write_annotated(shown)
+            ann_idx = self.write_annotated(shown) if new_frame else "NA"
             cv2.imshow(WINDOW, shown)
 
             k = decode_key(cv2.waitKeyEx(1))
-            frame_idx += 1
 
             if state == "ready":
                 if k == "s":
@@ -764,10 +837,13 @@ class ExperimentController(TaskController):
                     rec["grasp_instr"] = t_rel
                 print(f"    {k} @ {t_rel}s")
 
-            self.log_frame(rec, blk, i_cond, target, target_cls, outputs, frame_fps,
-                           raw_idx, ann_idx, instr, tactile)
-
             timed_out = self.time_limit > 0 and time.time() - rec["start"] > self.time_limit
+            ends = k in OUTCOMES or timed_out or k == "c"
+            # log each new camera frame, plus any instruction or end-of-trial key press
+            if new_frame or instr or ends:
+                self.log_frame(rec, blk, i_cond, target, target_cls, outputs, frame_fps,
+                               raw_idx, seq, ann_idx, instr, tactile)
+
             if k in OUTCOMES or timed_out:
                 key = k if k in OUTCOMES else ""
                 self.finish_trial(rec, blk, i + 1, i_cond, target, key,
@@ -780,13 +856,15 @@ class ExperimentController(TaskController):
 
         return "done"
 
-    # Session: run all tasks and blocks, with breaks and instructions
+    # Session logic
     def run_session(self, plan):
         hints = {"auditory": "AUDITORY: no bracelet - guide verbally (log with arrows / G)",
                  "tactile": "TACTILE: bracelet guidance - make sure the bracelet is worn"}
         for t_idx, (task, blocks) in enumerate(plan):
             self.configure_task(task)
             for b_idx, blk in enumerate(blocks):
+                if task == "depth_navigation":
+                    self.ask_layout(f"block {blk['block']}/{blk['n_blocks']} ({blk['condition']})")
                 if t_idx == 0 and b_idx == 0:
                     head = "SESSION START"
                 elif b_idx == 0:
@@ -798,8 +876,9 @@ class ExperimentController(TaskController):
                          f"Next: task {t_idx + 1}/3 '{task}'",
                          f"      {blk['condition'].upper()} block {blk['block']}/{blk['n_blocks']}"
                          f"  ({len(blk['trials'])} trials)",
-                         hints[blk["condition"]], "",
-                         "SPACE = start block     C = abort session"]
+                         hints[blk["condition"]],
+                         f"Obstacle layout: {self.obstacle_layout or 'none'}" if task == "depth_navigation" else "",
+                         "", "SPACE = start block     C = abort session"]
                 if not self.wait_screen(lines):
                     return False
                 if self.run_block(blk) == "abort":
@@ -827,7 +906,7 @@ class ExperimentController(TaskController):
                 pass
 
 
-# Plan
+# Experiment plan 
 def build_plan(trials, block_size, orders, shuffle, rng):
     plan, g = [], 0
     for task in TASKS:
@@ -912,6 +991,13 @@ def load_calibration(participant):
                 sys.exit("Please re-import the calibration file. Aborting.")
 
 
+def file_hash(path):
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:12]
+    except Exception:
+        return "NA"
+
+
 def main():
     ap = argparse.ArgumentParser(description="Combined auditory/tactile experiment.")
     ap.add_argument("-p", "--participant", type=int, required=True)
@@ -953,16 +1039,22 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     prefix = f"participant_{args.participant}_{stamp}"
-    csv_path = out_dir / f"{prefix}_trials.csv"
-    frames_path = out_dir / f"{prefix}_frames.csv"
-    video_dir = out_dir / "videos" / prefix
+    csv_path = (out_dir / f"{prefix}_trials.csv").resolve()
+    frames_path = (out_dir / f"{prefix}_frames.csv").resolve()
+    video_dir = (out_dir / "videos" / prefix).resolve()
 
     intensities, cal_source = load_calibration(args.participant)
 
     with open(out_dir / f"{prefix}_config.json", "w") as f:
-        json.dump(dict(vars(args), trials=trials, block_size=block_size, orders=orders,
+        json.dump(dict(vars(args), script_version=SCRIPT_VERSION, trials=trials,
+                       block_size=block_size, orders=orders, targets=TASK_TARGETS,
                        intensities=intensities, calibration_source=cal_source,
-                       start=stamp, plan=[(t, b) for t, b in plan]), f, indent=2)
+                       start=stamp,
+                       bracelet_sha=file_hash(root / "bracelet.py"),
+                       experiment_sha=file_hash(Path(__file__).resolve()),
+                       csv_path=str(csv_path), frames_path=str(frames_path),
+                       video_dir=str(video_dir),
+                       plan=[(t, b) for t, b in plan]), f, indent=2)
 
     belt_controller = None
     if not args.mock_navigate:
