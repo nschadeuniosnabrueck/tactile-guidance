@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-experiment.py - combined auditory / tactile grasping experiment (script v2.1, frame-gated).
+experiment.py - combined auditory / tactile grasping experiment.
 
 Tasks always run in this order: grasping -> multiple_objects -> depth_navigation.
 Within each task, auditory and tactile blocks alternate (A T A T ... or T A T A ...).
@@ -13,13 +13,21 @@ Keys, in the OpenCV window:
   RUNNING state
     Y / N / F / T   end trial: success / fail / system fail / wrong target
     C               abort session (current trial logged as 'aborted')
+    M               depth_navigation only: mark a move-back (experimenter observation)
+                    auditory: also adds 'B' to the instruction sequence
     Auditory only: arrow keys = L/R/U/D instruction, G = grasp instruction
   BREAK screen
     SPACE    continue,  C  abort
 
-Tactile condition: full pipeline + bracelet guidance. Perception and bracelet logic run
-only on NEW camera frames; duplicate frames reuse the last result.
-Auditory condition: camera preview only, no models run, experimenter guides verbally.
+Belt gating: bracelet commands are sent only while a TACTILE block is running.
+Outside tactile blocks (auditory blocks, breaks, setup) all vibration commands are dropped
+and the belt is stopped. Dropped commands are counted in belt_cmds_blocked.
+
+Move-back recording (depth_navigation):
+  move_back_signal_*  automatic: every move-back pulse the bracelet sends
+                      (channel 1, orientation 0b101000); episodes split by gaps > 1 s
+  move_back_manual_*  experimenter: M key presses
+  move_back_s / n_move_back  detector-based episodes (from v2.1), kept for comparison
 
 Success without a grasp signal (tactile): the experimenter is asked in the terminal
   success_no_signal = 1  -> kept as success
@@ -54,8 +62,11 @@ import cv2
 import numpy as np
 import torch
 
-SCRIPT_VERSION = "2.1-frame-gated"
-MOVE_BACK_MIN_S = 0.5          # move-back shorter than this is treated as flicker
+SCRIPT_VERSION = "belt-gate-move-back"
+MOVE_BACK_MIN_S = 0.5                 # detector-based move-back shorter than this is flicker
+MOVE_BACK_CHANNEL = 1                 # must match bracelet.py move-back pulse
+MOVE_BACK_ORIENTATION = 0b101000      # must match bracelet.py move-back pulse
+SIGNAL_EPISODE_GAP_S = 1.0            # gap that splits move-back pulses into separate episodes
 
 
 # xformers shim: UniDepth (V1 and V2 DepthHead) imports
@@ -170,6 +181,9 @@ FIELDS = [
     "first_instr_s", "grasp_instr_s", "num_instructions", "instructions", "instr_times_s",
     "n_frames", "mean_fps", "hand_detect_rate", "target_detect_rate",
     "obstacle_frame_rate", "first_obstacle_s", "n_move_back", "move_back_s",
+    "move_back_signal_n", "move_back_signal_times_s",
+    "move_back_manual_n", "move_back_manual_times_s",
+    "belt_cmds_blocked",
     "video_raw", "video_annotated",
     "outcome_key", "outcome",
 ]
@@ -182,6 +196,7 @@ FRAME_FIELDS = [
     "target_x", "target_y", "target_w", "target_h", "target_conf", "target_depth",
     "hand_detected", "target_detected",
     "frozen", "grasped", "obstacle", "obstacle_x", "obstacle_y", "roi_min_y", "move_back",
+    "mb_signal_sent", "mb_manual",
     "int_right", "int_left", "int_top", "int_bottom",
     "instruction",
     "t_perceive_ms", "t_nav_ms",
@@ -228,6 +243,16 @@ def point_xy(p):
         return round(float(a[0]), 1), round(float(a[1]), 1)
     except Exception:
         return "NA", "NA"
+
+
+def count_episodes(times, gap=SIGNAL_EPISODE_GAP_S):
+    """Number of episodes in a sorted list of event times, split where the gap exceeds `gap`."""
+    n, prev = 0, None
+    for t in times:
+        if prev is None or t - prev > gap:
+            n += 1
+        prev = t
+    return n
 
 
 def write_timestamps(path, times):
@@ -340,10 +365,18 @@ class ExperimentController(TaskController):
         self.frame_writer = None
         self._nav_this_frame = False
         self._last_timing = {"t_perceive_ms": "NA", "t_nav_ms": "NA"}
+        # belt gate and move-back recording
+        self.belt_enabled = False
+        self._belt_wrapped = False
+        self._belt_blocked = 0            # commands dropped by the gate (total)
+        self._mb_sig_times = []           # wall times of move-back pulses actually sent
+        self._mb_sig_pending = 0          # move-back pulses since last logged frame
+        self._pending_manual = False      # M pressed since last logged frame
 
     # Setup
     def setup(self):
         self.bs = 1
+        self.install_belt_gate()          # fails closed: session cannot start without the gate
         self.load_object_detector()
         self.stride = int(self.model_obj.stride)
         self.pt_obj = self.model_obj.pt
@@ -405,6 +438,52 @@ class ExperimentController(TaskController):
                 trk.tracks = []
             if hasattr(trk, "_next_id"):
                 trk._next_id = 1
+
+    # Belt gate: vibration only during tactile blocks
+    def install_belt_gate(self):
+        """Wrap the belt's send methods. Commands are dropped unless belt_enabled is True.
+        Move-back pulses that are actually sent are timestamped."""
+        bc = self.belt_controller
+        if bc is None or self._belt_wrapped:
+            return
+        try:
+            orig_vib = bc.send_vibration_command
+            orig_pulse = bc.send_pulse_command
+        except AttributeError as e:
+            raise RuntimeError(f"Cannot gate belt commands ({e}). Refusing to start.")
+
+        def gated_vibration(*args, **kwargs):
+            if not self.belt_enabled:
+                self._belt_blocked += 1
+                return None
+            return orig_vib(*args, **kwargs)
+
+        def gated_pulse(*args, **kwargs):
+            if not self.belt_enabled:
+                self._belt_blocked += 1
+                return None
+            if (kwargs.get("channel_index") == MOVE_BACK_CHANNEL
+                    and kwargs.get("orientation") == MOVE_BACK_ORIENTATION):
+                self._mb_sig_times.append(time.time())
+                self._mb_sig_pending += 1
+            return orig_pulse(*args, **kwargs)
+
+        try:
+            bc.send_vibration_command = gated_vibration
+            bc.send_pulse_command = gated_pulse
+        except Exception as e:
+            raise RuntimeError(f"Cannot gate belt commands ({e}). Refusing to start.")
+        self._belt_wrapped = True
+        print("Belt gate installed: vibration only during tactile blocks.")
+
+    def set_belt_enabled(self, flag):
+        flag = bool(flag) and self.belt_controller is not None
+        if self.belt_enabled and not flag:
+            # stop anything still running (including pulse series), then stop again to be safe
+            self.stop_belt()
+            time.sleep(0.1)
+            self.stop_belt()
+        self.belt_enabled = flag
 
     # Video recording
     def start_block_video(self, blk):
@@ -514,7 +593,7 @@ class ExperimentController(TaskController):
             rec["vib_timer"] = -1
         return None
 
-    # Move-back detection: obstacle in front of hand, hand and target both present, ROI <= 5
+    # Move-back detection (detector-based): obstacle in front of hand, ROI <= 5
     def _close_move_back(self, rec, t_rel, min_s=MOVE_BACK_MIN_S):
         """End an open move-back episode. Episodes shorter than min_s are treated as flicker."""
         if rec["mb_start"] is None:
@@ -540,6 +619,9 @@ class ExperimentController(TaskController):
         if fps is not None:
             rec["fps"].append(fps)
 
+        sig_sent, self._mb_sig_pending = self._mb_sig_pending, 0
+        manual, self._pending_manual = self._pending_manual, False
+
         row = dict.fromkeys(FRAME_FIELDS, "NA")
         row.update(participant=self.participant, task=self.task, condition=blk["condition"],
                    block_global=blk["block_global"], trial_in_condition=i_cond, target=target,
@@ -547,7 +629,8 @@ class ExperimentController(TaskController):
                    wall_time=round(now, 4),
                    fps=round(fps, 1) if fps is not None else "NA",
                    raw_video_frame=raw_idx, annotated_video_frame=ann_idx,
-                   instruction=instr, n_dets=len(outputs))
+                   instruction=instr, n_dets=len(outputs),
+                   mb_signal_sent=sig_sent, mb_manual=int(manual))
         row.update(self._last_timing)
 
         if tactile:
@@ -659,14 +742,15 @@ class ExperimentController(TaskController):
             self.obstacle_layout = lbl
         print(f"  layout now: '{self.obstacle_layout or 'none'}'")
 
-    # Trials logic
+    # Trial logic
     def start_trial(self, cond):
         rec = dict(start=time.time(), grasped=False, vib_timer=None, freeze_t=None,
                    n_instr=0, instr="", last_instr=None, instr_times=[],
                    first_instr=None, grasp_instr=None,
                    frames=0, fps=[], hand_frames=0, target_frames=0,
                    obstacle_frames=0, first_obstacle=None,
-                   mb_start=None, mb_episodes=0, mb_time_s=0.0)
+                   mb_start=None, mb_episodes=0, mb_time_s=0.0,
+                   mb_manual=[], blocked0=self._belt_blocked)
         if cond == "tactile":
             self.bracelet_controller = BraceletController(
                 vibration_intensities=self.participant_vibration_intensities)
@@ -679,6 +763,7 @@ class ExperimentController(TaskController):
         self._close_move_back(rec, end - rec["start"])
         self.stop_belt()
         aud = blk["condition"] == "auditory"
+        depth_task = (not aud) and self.task == "depth_navigation"
         rel = lambda t: round(t - rec["start"], 3) if isinstance(t, (int, float)) else "NA"
         nav = frz = grs = "NA"
         if not aud and self.bracelet_controller:
@@ -697,9 +782,13 @@ class ExperimentController(TaskController):
                 success_no_signal = 1
             print(f"  -> recorded: {outcome}")
 
+        # Move-back: automatic signal episodes and experimenter marks, within this trial
+        sig_times = [round(t - rec["start"], 3) for t in self._mb_sig_times
+                     if rec["start"] <= t <= end]
+        man = rec["mb_manual"]
+
         n = rec["frames"]
         rate = lambda c: round(c / n, 3) if (n and not aud) else "NA"
-        depth_task = (not aud) and self.task == "depth_navigation"
 
         self.write_row(dict(
             participant=self.participant, task=self.task, condition=blk["condition"],
@@ -724,6 +813,11 @@ class ExperimentController(TaskController):
                               else "NA"),
             n_move_back=rec["mb_episodes"] if depth_task else "NA",
             move_back_s=round(rec["mb_time_s"], 3) if depth_task else "NA",
+            move_back_signal_n=count_episodes(sig_times) if depth_task else "NA",
+            move_back_signal_times_s=";".join(map(str, sig_times)) if depth_task and sig_times else "NA",
+            move_back_manual_n=len(man) if depth_task else "NA",
+            move_back_manual_times_s=";".join(map(str, man)) if depth_task and man else "NA",
+            belt_cmds_blocked=self._belt_blocked - rec["blocked0"],
             video_raw=self.raw_path.name if self.raw_path else "NA",
             video_annotated=self.ann_path.name if self.ann_path else "NA",
             outcome_key=key, outcome=outcome))
@@ -733,19 +827,24 @@ class ExperimentController(TaskController):
         self.bracelet_controller = None
 
     def run_block(self, blk):
+        tactile = blk["condition"] == "tactile"
+        # Belt off before anything else. Auditory blocks never vibrate.
+        self.set_belt_enabled(False)
+        self.stop_belt()
         self.start_block_video(blk)
+        self.set_belt_enabled(tactile)
         try:
             return self._run_block(blk)
         finally:
-            self.stop_block_video()
+            self.set_belt_enabled(False)
             self.stop_belt()
+            self.stop_block_video()
 
     def _run_block(self, blk):
         cond = blk["condition"]
         tactile = cond == "tactile"
         color = (0, 255, 0) if tactile else (0, 165, 255)
         self.reset_perception()
-        self.stop_belt()
         trials = blk["trials"]
         i, state, rec, frame_idx = 0, "ready", None, 0
         last_seq, last_new_t, new_hist = None, None, []
@@ -792,6 +891,8 @@ class ExperimentController(TaskController):
                 hud.append("READY - S start trial | O set layout label")
             else:
                 hud.append(f"RUNNING {time.time() - rec['start']:5.1f}s | Y ok  N fail  F sys-fail  T wrong")
+                if self.task == "depth_navigation":
+                    hud.append("M = mark move-back")
                 if not tactile:
                     hud.append(f"Instructions: {rec['n_instr']}  {rec['instr'][-20:]}  (arrows / G)")
                 elif rec["grasped"]:
@@ -824,6 +925,7 @@ class ExperimentController(TaskController):
 
             # running
             instr = ""
+            mb_key = False
             if not tactile and k in INSTR_SYMBOL and k != rec["last_instr"]:
                 t_rel = round(time.time() - rec["start"], 3)
                 rec["n_instr"] += 1
@@ -837,10 +939,23 @@ class ExperimentController(TaskController):
                     rec["grasp_instr"] = t_rel
                 print(f"    {k} @ {t_rel}s")
 
+            if k == "m" and self.task == "depth_navigation":
+                t_rel = round(time.time() - rec["start"], 3)
+                rec["mb_manual"].append(t_rel)
+                self._pending_manual = True
+                mb_key = True
+                print(f"    move-back marked @ {t_rel}s")
+                if not tactile:
+                    # auditory: the verbal move-back instruction goes into the instruction sequence
+                    rec["n_instr"] += 1
+                    rec["instr"] += "B"
+                    rec["instr_times"].append(t_rel)
+                    instr = "B"
+
             timed_out = self.time_limit > 0 and time.time() - rec["start"] > self.time_limit
             ends = k in OUTCOMES or timed_out or k == "c"
-            # log each new camera frame, plus any instruction or end-of-trial key press
-            if new_frame or instr or ends:
+            # log each new camera frame, plus any instruction, move-back mark or end-of-trial key press
+            if new_frame or instr or ends or mb_key:
                 self.log_frame(rec, blk, i_cond, target, target_cls, outputs, frame_fps,
                                raw_idx, seq, ann_idx, instr, tactile)
 
@@ -858,7 +973,7 @@ class ExperimentController(TaskController):
 
     # Session logic
     def run_session(self, plan):
-        hints = {"auditory": "AUDITORY: no bracelet - guide verbally (log with arrows / G)",
+        hints = {"auditory": "AUDITORY: no bracelet - guide verbally (log with arrows / G / M)",
                  "tactile": "TACTILE: bracelet guidance - make sure the bracelet is worn"}
         for t_idx, (task, blocks) in enumerate(plan):
             self.configure_task(task)
@@ -879,17 +994,19 @@ class ExperimentController(TaskController):
                          hints[blk["condition"]],
                          f"Obstacle layout: {self.obstacle_layout or 'none'}" if task == "depth_navigation" else "",
                          "", "SPACE = start block     C = abort session"]
+                self.set_belt_enabled(False)   # break screen: belt off
                 if not self.wait_screen(lines):
                     return False
                 if self.run_block(blk) == "abort":
                     print("SESSION ABORTED")
                     return False
+        self.set_belt_enabled(False)
         self.wait_screen(["SESSION COMPLETE", "", f"Data: {self.csv_path.name}", "",
                           "Press SPACE to close"], (0, 255, 0))
         return True
 
     def close(self):
-        self.stop_belt()
+        self.set_belt_enabled(False)
         try:
             self.stop_block_video()
         except Exception:
@@ -906,7 +1023,7 @@ class ExperimentController(TaskController):
                 pass
 
 
-# Experiment plan 
+# Experiment plan
 def build_plan(trials, block_size, orders, shuffle, rng):
     plan, g = [], 0
     for task in TASKS:
@@ -1052,6 +1169,8 @@ def main():
                        start=stamp,
                        bracelet_sha=file_hash(root / "bracelet.py"),
                        experiment_sha=file_hash(Path(__file__).resolve()),
+                       move_back_channel=MOVE_BACK_CHANNEL,
+                       move_back_orientation=MOVE_BACK_ORIENTATION,
                        csv_path=str(csv_path), frames_path=str(frames_path),
                        video_dir=str(video_dir),
                        plan=[(t, b) for t, b in plan]), f, indent=2)
